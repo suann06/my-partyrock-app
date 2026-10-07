@@ -1,0 +1,14 @@
+{
+  "name": "taste-of-malaysia",
+  "version": "1.0.0",
+  "description": "Taste of Malaysia static website with Bedrock AI chatbot",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "3.1145.0",
+    "express": "4.21.2"
+  }
+}
