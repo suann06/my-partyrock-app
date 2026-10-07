@@ -129,12 +129,26 @@
 
 /* =============================================
    FOODIE AI CHATBOT — frontend logic
-   Communicates with POST /api/chat on the
-   Express server. Never talks to Bedrock directly.
+
+   In production (S3 + API Gateway):
+     window.CHAT_API_URL is set by the inline <script>
+     block in index.html, which deploy.yml replaces
+     with the real API Gateway endpoint URL before
+     uploading to S3.
+
+   Locally (Express server.js):
+     window.CHAT_API_URL falls back to '/api/chat',
+     which Express handles directly.
    ============================================= */
 
 (function () {
   'use strict';
+
+  /* ── Resolve the API endpoint ── */
+  /* window.CHAT_API_URL is set in index.html before this script loads. */
+  var API_URL = (window.CHAT_API_URL && window.CHAT_API_URL !== '/api/chat')
+    ? window.CHAT_API_URL          // production: full API Gateway URL
+    : '/api/chat';                 // local: relative path handled by Express
 
   /* ── Element references ── */
   const fab        = document.getElementById('chatFab');
@@ -150,7 +164,7 @@
 
   /* ── Welcome message (shown once on first open) ── */
   const WELCOME =
-    '👋 Hi! I\'m Foodie AI Assistant. Ask me anything about Malaysian cuisine — ' +
+    '\uD83D\uDC4B Hi! I\'m Foodie AI Assistant. Ask me anything about Malaysian cuisine \u2014 ' +
     'dishes, ingredients, cooking methods or food culture. How can I help you today?';
 
   let welcomeShown = false;
@@ -202,7 +216,7 @@
      Set UI to loading / idle state
      ============================================= */
   function setLoading(isLoading) {
-    loading.hidden  = !isLoading;
+    loading.hidden   = !isLoading;
     sendBtn.disabled = isLoading;
     input.disabled   = isLoading;
 
@@ -212,7 +226,7 @@
   }
 
   /* =============================================
-     Send a message to /api/chat
+     Send a message to the chat API
      ============================================= */
   async function sendMessage() {
     const userText = input.value.trim();
@@ -228,7 +242,7 @@
     setLoading(true);
 
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: history })
@@ -239,7 +253,7 @@
       if (!res.ok || data.error) {
         /* Server returned an error — show it as an error bubble */
         const errText = data.error || 'Something went wrong. Please try again.';
-        appendMessage('error', '⚠️ ' + errText);
+        appendMessage('error', '\u26A0\uFE0F ' + errText);
 
         /* Remove the failed user turn from history so the user can retry */
         history.pop();
@@ -251,10 +265,11 @@
       history.push({ role: 'assistant', content: data.reply });
 
     } catch (networkErr) {
-      /* Network failure (server not running, etc.) */
+      /* Network failure (server not running, CORS issue, etc.) */
       appendMessage(
         'error',
-        '⚠️ Could not reach the server. Make sure the Node.js server is running on http://localhost:3000.'
+        '\u26A0\uFE0F Could not reach the server. ' +
+        'If running locally, make sure Node.js server is running on http://localhost:3000.'
       );
       /* Roll back the failed user message */
       history.pop();

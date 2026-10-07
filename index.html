@@ -237,6 +237,17 @@
   </div>
   <!-- ===== END CHATBOT ===== -->
 
+  <!--
+    CHAT_API_URL is injected by the GitHub Actions deploy workflow.
+    It is replaced with the real API Gateway URL before upload to S3.
+    When running locally via server.js the placeholder is never injected,
+    so script.js falls back to the relative path '/api/chat'.
+  -->
+  <script>
+    // Populated at deploy time by sed replacement in deploy.yml.
+    // Falls back to relative path when running locally via server.js.
+    window.CHAT_API_URL = window.CHAT_API_URL || '/api/chat';
+  </script>
   <script src="script.js"></script>
 </body>
 </html>
