@@ -1,0 +1,3 @@
+# boto3 is pre-installed in all AWS Lambda Python runtimes.
+# No additional packages are required for chat.py.
+# Add third-party packages here if you extend the Lambda in the future.
