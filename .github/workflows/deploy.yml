@@ -1,0 +1,240 @@
+# =============================================================================
+# Taste of Malaysia — CI/CD Deploy Workflow
+# =============================================================================
+#
+# What this workflow does:
+#   1. validate   — runs `sam validate` to catch template errors early
+#   2. deploy-backend — sam build + sam deploy (Lambda + API Gateway)
+#   3. deploy-frontend — injects the live API Gateway URL into index.html,
+#                        then syncs frontend/ to the S3 static website bucket
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID      — IAM user/role access key
+#   AWS_SECRET_ACCESS_KEY  — IAM user/role secret key
+#   AWS_REGION             — Region to deploy to (e.g. ap-southeast-5)
+#   SAM_DEPLOY_BUCKET      — Existing S3 bucket SAM uses for deployment
+#                            artefacts (create once with `aws s3 mb`)
+#
+# Optional GitHub Variables (or hard-code defaults below):
+#   STACK_NAME             — CloudFormation stack name
+#                            (default: taste-of-malaysia)
+# =============================================================================
+
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main          # deploy on every push to main
+  workflow_dispatch:  # allow manual trigger from GitHub Actions UI
+
+# Prevent overlapping deploys for the same branch
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # don't cancel in-flight deploys; queue instead
+
+env:
+  # ── These can be overridden with GitHub Variables if needed ──────────────
+  STACK_NAME:       ${{ vars.STACK_NAME || 'taste-of-malaysia' }}
+  SAM_TEMPLATE:     infra/template.yaml
+  FRONTEND_DIR:     frontend
+  PYTHON_VERSION:   "3.12"
+  SAM_CLI_VERSION:  "1.127.0"   # pin SAM CLI for reproducible builds
+
+jobs:
+
+  # ── Job 1: Validate the SAM template ──────────────────────────────────────
+  validate:
+    name: Validate SAM Template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          version: ${{ env.SAM_CLI_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Validate SAM template
+        run: sam validate --template ${{ env.SAM_TEMPLATE }} --lint
+
+  # ── Job 2: Build and deploy backend (Lambda + API Gateway) ────────────────
+  deploy-backend:
+    name: Deploy Backend (SAM)
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      # Pass the live API URL and bucket name to the next job
+      api_url:    ${{ steps.stack-outputs.outputs.api_url }}
+      bucket_name: ${{ steps.stack-outputs.outputs.bucket_name }}
+      website_url: ${{ steps.stack-outputs.outputs.website_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          version: ${{ env.SAM_CLI_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # sam build: packages the Lambda code and resolves the CodeUri path
+      # (../backend/lambda relative to infra/template.yaml)
+      - name: SAM build
+        run: |
+          sam build \
+            --template ${{ env.SAM_TEMPLATE }} \
+            --build-dir .aws-sam/build
+
+      # sam deploy: creates or updates the CloudFormation stack
+      - name: SAM deploy
+        run: |
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name     ${{ env.STACK_NAME }} \
+            --s3-bucket      ${{ secrets.SAM_DEPLOY_BUCKET }} \
+            --s3-prefix      sam-artifacts \
+            --region         ${{ secrets.AWS_REGION }} \
+            --capabilities   CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              BedrockRegion=${{ secrets.AWS_REGION }} \
+              StageName=prod
+
+      # Read the three Outputs from the CloudFormation stack
+      - name: Read stack outputs
+        id: stack-outputs
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region     ${{ secrets.AWS_REGION }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ChatApiUrl'].OutputValue" \
+            --output text)
+
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region     ${{ secrets.AWS_REGION }} \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" \
+            --output text)
+
+          WEBSITE=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region     ${{ secrets.AWS_REGION }} \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendWebsiteURL'].OutputValue" \
+            --output text)
+
+          echo "api_url=$API_URL"      >> "$GITHUB_OUTPUT"
+          echo "bucket_name=$BUCKET"   >> "$GITHUB_OUTPUT"
+          echo "website_url=$WEBSITE"  >> "$GITHUB_OUTPUT"
+
+          echo "### Backend deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **API URL**: $API_URL"          >> "$GITHUB_STEP_SUMMARY"
+          echo "- **S3 Bucket**: $BUCKET"         >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Website URL**: $WEBSITE"      >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Job 3: Inject API URL and sync frontend to S3 ─────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend (S3)
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # Copy the frontend files to a staging directory so we can edit
+      # index.html without touching the source files in the repo.
+      - name: Prepare frontend build directory
+        run: |
+          cp -r ${{ env.FRONTEND_DIR }} frontend-build
+
+      # Replace the fallback '/api/chat' placeholder in the inline <script>
+      # block (set by index.html) with the real API Gateway URL.
+      # The sed pattern targets the exact line written in frontend/index.html:
+      #   window.CHAT_API_URL = window.CHAT_API_URL || '/api/chat';
+      - name: Inject API Gateway URL into index.html
+        env:
+          API_URL: ${{ needs.deploy-backend.outputs.api_url }}
+        run: |
+          # Escape any forward slashes in the URL for sed
+          ESCAPED_URL=$(echo "$API_URL" | sed 's/[\/&]/\\&/g')
+          sed -i \
+            "s|window\.CHAT_API_URL = window\.CHAT_API_URL \|\| '/api/chat';|window.CHAT_API_URL = '$ESCAPED_URL';|g" \
+            frontend-build/index.html
+          echo "Injected API URL: $API_URL"
+
+      # Verify the injection worked before uploading
+      - name: Verify URL injection
+        run: |
+          if grep -q "CHAT_API_URL = '" frontend-build/index.html; then
+            echo "URL injection successful."
+          else
+            echo "ERROR: URL injection failed — CHAT_API_URL placeholder not replaced."
+            exit 1
+          fi
+
+      # Sync the three frontend files to S3 with appropriate cache headers:
+      #   - HTML: no-cache (always fresh so config changes take effect)
+      #   - CSS/JS: cache for 1 hour (content rarely changes mid-session)
+      - name: Upload index.html (no-cache)
+        run: |
+          aws s3 cp frontend-build/index.html \
+            s3://${{ needs.deploy-backend.outputs.bucket_name }}/index.html \
+            --content-type "text/html" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Upload style.css
+        run: |
+          aws s3 cp frontend-build/style.css \
+            s3://${{ needs.deploy-backend.outputs.bucket_name }}/style.css \
+            --content-type "text/css" \
+            --cache-control "public, max-age=3600" \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Upload script.js
+        run: |
+          aws s3 cp frontend-build/script.js \
+            s3://${{ needs.deploy-backend.outputs.bucket_name }}/script.js \
+            --content-type "application/javascript" \
+            --cache-control "public, max-age=3600" \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Print website URL
+        run: |
+          echo "### Frontend deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Website: ${{ needs.deploy-backend.outputs.website_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "Website live at: ${{ needs.deploy-backend.outputs.website_url }}"
